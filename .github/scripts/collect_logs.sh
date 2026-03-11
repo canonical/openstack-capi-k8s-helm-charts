@@ -74,6 +74,14 @@ get_workload_pods_info() {
             $kubectl_cmd --kubeconfig="$kubeconfig" get nodes -o yaml > "logs/${cluster_name}-workload-nodes.yaml" 2>/dev/null || \
                 echo "Warning: Could not get node YAML for cluster '$cluster_name'"
 
+            # Get and save events (helps debugging pod waits vs scaling churn)
+            $kubectl_cmd --kubeconfig="$kubeconfig" get events --all-namespaces --sort-by=.lastTimestamp > "logs/${cluster_name}-workload-events.log" 2>/dev/null || \
+                echo "Warning: Could not get events for cluster '$cluster_name'"
+
+            # Get and save pod statuses in a compact form
+            $kubectl_cmd --kubeconfig="$kubeconfig" get pods --all-namespaces -o wide > "logs/${cluster_name}-workload-pods-status.log" 2>/dev/null || \
+                echo "Warning: Could not get pod statuses for cluster '$cluster_name'"
+
             # Get all pod names and namespaces and save logs
             all_workload_pods=$($kubectl_cmd --kubeconfig="$kubeconfig" get pods --all-namespaces -o=jsonpath='{range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{" "}{end}')
 
@@ -117,7 +125,11 @@ for namespace in $($kubectl_cmd get ns -o jsonpath='{.items[*].metadata.name}');
   fi
 
   echo "--- Processing namespace: $namespace ---"
- 
+
+  # Get events for the namespace (helps debugging machine/pod issues)
+  $kubectl_cmd -n "$namespace" get events --sort-by=.lastTimestamp > logs/"$namespace"-events.log 2>/dev/null || \
+    echo "Warning: Could not get events for namespace: $namespace"
+
   # Get YAML output for pods
   $kubectl_cmd -n "$namespace" get po -o yaml > logs/"$namespace"-po.yaml
  
