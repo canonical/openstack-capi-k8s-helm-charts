@@ -36,6 +36,15 @@ clusterNetwork:
 # More information can be found here: https://github.com/canonical/cluster-api-k8s/blob/main/controlplane/config/crd/bases/controlplane.cluster.x-k8s.io_ck8scontrolplanes.yaml
 # ck8sControlPlane: Control plane related configuration (dictionary)
 ck8sControlPlane:
+  # initConfig: Cluster feature configuration applied at bootstrap (dictionary)
+  initConfig:
+    # enableDefaultIngress: Deploy the built-in default ingress (cilium).
+    # Disabled by default: on OpenStack it provisions an Octavia load
+    # balancer (via the OpenStack cloud controller manager) that no Magnum
+    # or CAPI component tracks, blocking cluster deletion. Users needing
+    # ingress should deploy their own ingress controller behind a
+    # LoadBalancer Service instead.
+    enableDefaultIngress: false
   # machhineTemplate: Information on how machines should be shaped (dictionary)
   machineTemplate:
     # nodeDeletionTimeout: How long the machine controller will attempt to delete the Node that the Machine hosts after the Machine is marked for deletion (string)
