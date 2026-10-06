@@ -33,8 +33,18 @@ DEFAULT_VALUES = {
     #         }
     #     }
     # },
+    # Worker node group with autoscaling enabled (min 1, max 2): the
+    # MachineDeployment gets the min/max size annotations and no replicas,
+    # leaving node count control to cluster-autoscaler
     "nodeGroups": [
-        {"machineCount": 1, "name": "default-worker", "machineFlavor": "m1.medium"}
+        {
+            "machineCount": 1,
+            "name": "default-worker",
+            "machineFlavor": "m1.medium",
+            "autoscale": True,
+            "machineCountMin": 1,
+            "machineCountMax": 2,
+        }
     ],
     "cloudName": CLOUD_NAME,
     "machineSSHKeyName": "sunbeam",
@@ -55,6 +65,13 @@ DEFAULT_VALUES = {
             "networkFilter": None,
         },
         "externalNetworkId": "7af20ab4-a12e-49ca-945c-fce56fe2557f",
+    },
+    "cluster-autoscaler": {
+        # CI-only override: with the default 10m unneeded-time the
+        # scale-down phase of the functional test would barely fit its
+        # 15 minute timeout (it also competes with the 10 minute
+        # post-scale-up scale-down cooldown).
+        "extraArgs": {"scale-down-unneeded-time": "1m"},
     },
     "addons": {
         "openstack": {

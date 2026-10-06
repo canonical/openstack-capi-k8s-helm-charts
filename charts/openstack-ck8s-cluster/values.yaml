@@ -223,6 +223,11 @@ cluster-autoscaler:
     clusterName: "{{ include \"openstack-ck8s-cluster.clusterName\" . }}"
     namespace: "{{ .Release.Namespace }}"
   clusterAPIMode: kubeconfig-incluster
+  # Namespace used by the cluster-autoscaler in the workload cluster for
+  # leader election and its status configmap. It must exist in the workload
+  # cluster, so it cannot be the release namespace (which only exists in the
+  # management cluster).
+  clusterAPIConfigMapsNamespace: kube-system
   extraArgs:
     logtostderr: true
     stderrthreshold: info
