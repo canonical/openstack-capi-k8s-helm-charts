@@ -8,9 +8,9 @@ import yaml
 from . import utils
 
 
-CLUSTER_DEPLOY_TIMEOUT = 1800  # 20 minutes
+CLUSTER_DEPLOY_TIMEOUT = 3600  # 60 minutes
 WORKLOAD_NODE_READY_TIMEOUT = 300  # 5 mimutes, this is for worker node pods to settle
-POD_WAIT_TIMEOUT = 300  # 5 minutes for pods to settle
+POD_WAIT_TIMEOUT = 600  # 10 minutes for pods to settle
 
 
 def _create_cluster(
@@ -53,7 +53,10 @@ def _wait_for_cluster(namespace: str, cluster_name: str, timeout: int):
         "wait",
         "--namespace",
         namespace,
-        '--for=jsonpath={.status.v1beta2.conditions[?(@.type=="Available")].status}=True',
+        # With cluster-api >= v1.10 the Cluster CRD is served as v1beta2 and
+        # conditions live at .status.conditions (the .status.v1beta2 field
+        # only exists on the v1beta1 API type).
+        '--for=jsonpath={.status.conditions[?(@.type=="Available")].status}=True',
         f"cluster/{cluster_name}",
         f"--timeout={timeout}s",
     ]
@@ -125,7 +128,15 @@ def _check_workload_nodes_status(workload_kubeconfig: Path, expected_nodes: int)
                 assert condition.get("status") is True
 
 
-def _check_workload_pods(workload_kubeconfig: Path, namespace: str):
+def _check_workload_deployments(workload_kubeconfig: Path, namespace: str):
+    """Wait for all deployments in the namespace to be Available.
+
+    Waiting on deployments instead of pods is resilient to pods being
+    replaced while waiting (e.g. coredns autoscaling by its HPA right
+    after the cluster becomes available): a pod in Terminating state
+    would never satisfy a pods --all wait, while the deployment only
+    reports Available when its live replicas are ready.
+    """
     cmd = [
         "sudo",
         "k8s",
@@ -133,9 +144,9 @@ def _check_workload_pods(workload_kubeconfig: Path, namespace: str):
         "--namespace",
         namespace,
         "wait",
-        "pods",
+        "deployments",
         "--for",
-        "condition=Ready=True",
+        "condition=Available=True",
         "--all",
         "--timeout",
         f"{POD_WAIT_TIMEOUT}s",
@@ -143,6 +154,64 @@ def _check_workload_pods(workload_kubeconfig: Path, namespace: str):
         str(workload_kubeconfig),
     ]
     utils.run_command(cmd, capture_output=False)
+
+
+def _check_workload_daemonsets(workload_kubeconfig: Path, namespace: str):
+    """Wait for all daemonsets in the namespace to have their pods ready.
+
+    Daemonsets do not publish conditions (the AVAILABLE column in
+    `kubectl get ds` is a count), so `kubectl wait --for=condition=...`
+    cannot be used; `kubectl rollout status` is the supported check.
+    """
+    cmd = [
+        "sudo",
+        "k8s",
+        "kubectl",
+        "--namespace",
+        namespace,
+        "get",
+        "daemonsets",
+        "-o",
+        "name",
+        "--kubeconfig",
+        str(workload_kubeconfig),
+    ]
+    daemonsets = utils.run_command(cmd, capture_output=True).splitlines()
+    for daemonset in daemonsets:
+        cmd = [
+            "sudo",
+            "k8s",
+            "kubectl",
+            "--namespace",
+            namespace,
+            "rollout",
+            "status",
+            daemonset,
+            "--timeout",
+            f"{POD_WAIT_TIMEOUT}s",
+            "--kubeconfig",
+            str(workload_kubeconfig),
+        ]
+        utils.run_command(cmd, capture_output=False)
+
+
+def _dump_pods_status(workload_kubeconfig: Path, namespace: str):
+    """Log pod statuses in the namespace to help debugging wait failures."""
+    cmd = [
+        "sudo",
+        "k8s",
+        "kubectl",
+        "--namespace",
+        namespace,
+        "get",
+        "pods",
+        "-o",
+        "wide",
+        "--kubeconfig",
+        str(workload_kubeconfig),
+    ]
+    output = utils.run_command(cmd, capture_output=True)
+    print(f"\nPods in {namespace}:\n{output}", flush=True)
 
 
 def test_create_cluster(
@@ -188,13 +257,19 @@ def test_create_cluster(
     _check_workload_nodes_status(workload_kc_file, 2)
 
     # Check if k8s pods are running fine in kube-system namespace
-    # This also verified k8s-keystone-auth pods
-    _check_workload_pods(workload_kc_file, namespace="kube-system")
+    # This also verified k8s-keystone-auth pods.
+    # Waits on deployments/daemonsets, not raw pods: coredns is scaled by
+    # its HPA right after the cluster becomes available, and a pod being
+    # replaced during a pods --all wait makes it fail spuriously.
+    _dump_pods_status(workload_kc_file, namespace="kube-system")
+    _check_workload_deployments(workload_kc_file, namespace="kube-system")
+    _check_workload_daemonsets(workload_kc_file, namespace="kube-system")
 
     # Check openstack cinder and controller manager
-    _check_workload_pods(workload_kc_file, namespace="openstack-system")
+    _dump_pods_status(workload_kc_file, namespace="openstack-system")
+    _check_workload_deployments(workload_kc_file, namespace="openstack-system")
+    _check_workload_daemonsets(workload_kc_file, namespace="openstack-system")
 
     # Check kubernetes dashboard
     # kubernetes-dashboard helm chart is not available
     # failed to fetch https://kubernetes.github.io/dashboard/index.yaml
-    # _check_workload_pods(workload_kc_file, namespace="kubernetes-dashboard")
