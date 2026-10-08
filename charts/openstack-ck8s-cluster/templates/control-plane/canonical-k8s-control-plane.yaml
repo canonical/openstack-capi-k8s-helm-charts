@@ -23,6 +23,9 @@ spec:
   remediationStrategy: {{ toYaml .Values.ck8sControlPlane.remediationStrategy | nindent 4 }}
   replicas: {{ .Values.controlPlane.machineCount }}
   spec:
+  {{- with .Values.ck8sControlPlane.initConfig }}
+    initConfig: {{ toYaml . | nindent 6 }}
+  {{- end }}
     {{- if .Values.addons.openstack.k8sKeystoneAuth.enabled }}
     files:
       - path: /var/snap/k8s/common/args/conf.d/k8s-auth-token-webhook.conf

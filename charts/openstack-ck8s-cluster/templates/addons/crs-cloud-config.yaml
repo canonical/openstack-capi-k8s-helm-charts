@@ -2,10 +2,11 @@
 apiVersion: addons.cluster.x-k8s.io/v1beta1
 kind: ClusterResourceSet
 metadata:
-  name: cloud-config-credentials
+  name: {{ include "openstack-ck8s-cluster.componentName" (list . "cloud-config-credentials") }}
 spec:
   clusterSelector:
     matchLabels:
+      {{- include "openstack-ck8s-cluster.selectorLabels" . | nindent 6 }}
       ccmOpenStackChart: enabled
   resources:
     - name: {{ include "openstack-ck8s-cluster.cloudCredentialsSecretName" . }}-for-crs
