@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: 2025 - Canonical Ltd
 # SPDX-License-Identifier: Apache-2.0
 
+import time
 from pathlib import Path
 
 import yaml
@@ -11,6 +12,34 @@ from . import utils
 CLUSTER_DEPLOY_TIMEOUT = 3600  # 60 minutes
 WORKLOAD_NODE_READY_TIMEOUT = 300  # 5 mimutes, this is for worker node pods to settle
 POD_WAIT_TIMEOUT = 600  # 10 minutes for pods to settle
+SCALE_UP_TIMEOUT = 900  # 15 minutes for a new machine to be provisioned
+SCALE_DOWN_TIMEOUT = 900  # 15 minutes for an unneeded node to be removed
+AUTOSCALE_TEST_CPU_REQUEST = "1700m"  # ~one pod per 2 vCPU worker node
+
+SCALE_UP_TEST_DEPLOYMENT = """
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scale-up-test
+  namespace: default
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: scale-up-test
+  template:
+    metadata:
+      labels:
+        app: scale-up-test
+    spec:
+      containers:
+      - name: pause
+        image: registry.k8s.io/pause:3.10
+        resources:
+          requests:
+            cpu: {cpu}
+            memory: 512Mi
+"""
 
 
 def _create_cluster(
@@ -88,22 +117,16 @@ def _get_workload_kubeconfig(
         f.write(kubeconfig_content)
 
 
-def _check_workload_nodes_status(workload_kubeconfig: Path, expected_nodes: int):
-    cmd = [
-        "sudo",
-        "k8s",
-        "kubectl",
-        "wait",
-        "nodes",
-        "--for=condition=Ready",
-        "--all",
-        "--timeout",
-        f"{WORKLOAD_NODE_READY_TIMEOUT}s",
-        "--kubeconfig",
-        str(workload_kubeconfig),
-    ]
-    utils.run_command(cmd, capture_output=False)
+def _check_workload_nodes_status(
+    workload_kubeconfig: Path, expected_nodes: int, timeout: int = WORKLOAD_NODE_READY_TIMEOUT
+):
+    """Wait until the workload cluster has expected_nodes nodes, all Ready.
 
+    Polls: `kubectl wait node --all --for=condition=Ready` only covers
+    already-registered nodes, and a machine takes minutes to register
+    after a MachineDeployment scale-up, so a one-shot count check races
+    machine provisioning.
+    """
     cmd = [
         "sudo",
         "k8s",
@@ -115,17 +138,150 @@ def _check_workload_nodes_status(workload_kubeconfig: Path, expected_nodes: int)
         "--kubeconfig",
         str(workload_kubeconfig),
     ]
-    nodes_str = utils.run_command(cmd, capture_output=True)
-    nodes = yaml.safe_load(nodes_str)
+    deadline = time.monotonic() + timeout
+    while True:
+        nodes = yaml.safe_load(utils.run_command(cmd, capture_output=True))
+        nodes = nodes.get("items", [])
+        all_ready = all(
+            any(
+                condition.get("type") == "Ready" and condition.get("status") == "True"
+                for condition in node.get("status", {}).get("conditions", [])
+            )
+            for node in nodes
+        )
+        if len(nodes) == expected_nodes and all_ready:
+            return
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"expected {expected_nodes} Ready nodes, got {len(nodes)} "
+                f"(all_ready={all_ready}) after {timeout}s"
+            )
+        time.sleep(10)
 
-    # Check if number of nodes are as expected
-    assert len(nodes.get("items", [])) == expected_nodes
 
-    # Check if the nodes are in ready state
-    for node in nodes.get("items", []):
-        for condition in node.get("conditions", []):
-            if condition.get("Type") == "Ready":
-                assert condition.get("status") is True
+def _wait_for_machine_deployment_replicas(
+    namespace: str, cluster_name: str, replicas: int, timeout: int
+):
+    """Wait for the worker MachineDeployment to have the given replica count.
+
+    The worker node group is autoscaled in this test, so the autoscaler is
+    in control of the replicas.
+    """
+    cmd = [
+        "sudo",
+        "k8s",
+        "kubectl",
+        "wait",
+        "--namespace",
+        namespace,
+        f"--for=jsonpath={{.spec.replicas}}={replicas}",
+        f"machinedeployment/{cluster_name}-default-worker",
+        f"--timeout={timeout}s",
+    ]
+    utils.run_command(cmd, capture_output=False)
+
+
+def _wait_for_scale_up_test_replicas(workload_kubeconfig: Path):
+    """Wait for at least one scale-up-test replica to be available."""
+    cmd = [
+        "sudo",
+        "k8s",
+        "kubectl",
+        "--kubeconfig",
+        str(workload_kubeconfig),
+        "--namespace",
+        "default",
+        "get",
+        "deployment",
+        "scale-up-test",
+        "--output",
+        "jsonpath={.status.availableReplicas}",
+    ]
+    deadline = time.monotonic() + POD_WAIT_TIMEOUT
+    while True:
+        available = utils.run_command(cmd, capture_output=True)
+        if available and int(available) >= 1:
+            return
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"scale-up-test has {available or 0} available replicas "
+                f"after {POD_WAIT_TIMEOUT}s"
+            )
+        time.sleep(10)
+
+
+def _test_scale_up_and_down(
+    namespace: str,
+    cluster_name: str,
+    workload_kubeconfig: Path,
+    config_path: Path,
+):
+    """Verify cluster-autoscaler scales the worker node group.
+
+    Deploys pods with a CPU request close to the worker flavor capacity,
+    so only one fits per node: with 3 replicas and 2 nodes to start with,
+    pods stay Pending until the autoscaler adds a node (up to the node
+    group max). Deleting the deployment makes the extra node unneeded
+    and the autoscaler removes it.
+
+    Note: the control plane node is schedulable but its system pods
+    (keystone-auth, metallb, cinder-csi, coredns, ...) request enough CPU
+    that a 1700m pod does not fit on it in the CI topology.
+    """
+    deployment = SCALE_UP_TEST_DEPLOYMENT.format(cpu=AUTOSCALE_TEST_CPU_REQUEST)
+    deployment_file = config_path / "scale-up-test.yaml"
+    with open(str(deployment_file), "w") as file:
+        file.write(deployment)
+    cmd = [
+        "sudo",
+        "k8s",
+        "kubectl",
+        "--kubeconfig",
+        str(workload_kubeconfig),
+        "apply",
+        "-f",
+        str(deployment_file),
+    ]
+    utils.run_command(cmd, capture_output=False)
+
+    # Expect the autoscaler to scale the worker machine deployment 1 -> 2
+    _wait_for_machine_deployment_replicas(
+        namespace, cluster_name, replicas=2, timeout=SCALE_UP_TIMEOUT
+    )
+    # The machine takes minutes to provision and register after the
+    # MachineDeployment replicas are patched: wait for the node.
+    _check_workload_nodes_status(
+        workload_kubeconfig, 3, timeout=SCALE_UP_TIMEOUT
+    )
+    # Verify a previously unschedulable pod actually landed on the new
+    # node. At most one replica can run in this topology (node group
+    # max 2, control plane and first worker too loaded for a 1700m pod),
+    # so check for >= 1 available replica, not for the full rollout.
+    _wait_for_scale_up_test_replicas(workload_kubeconfig)
+
+    # Scale down: remove the pods and expect the extra node to be removed
+    cmd = [
+        "sudo",
+        "k8s",
+        "kubectl",
+        "--kubeconfig",
+        str(workload_kubeconfig),
+        "delete",
+        "deployment",
+        "scale-up-test",
+        "--namespace",
+        "default",
+    ]
+    utils.run_command(cmd, capture_output=False)
+
+    _wait_for_machine_deployment_replicas(
+        namespace, cluster_name, replicas=1, timeout=SCALE_DOWN_TIMEOUT
+    )
+    # The node is drained and the machine deleted after the replicas are
+    # patched: wait for the node to go away.
+    _check_workload_nodes_status(
+        workload_kubeconfig, 2, timeout=SCALE_DOWN_TIMEOUT
+    )
 
 
 def _check_workload_deployments(workload_kubeconfig: Path, namespace: str):
@@ -256,6 +412,9 @@ def test_create_cluster(
     # Expected 2 nodes - 1 master and 1 worker
     _check_workload_nodes_status(workload_kc_file, 2)
 
+    # Verify cluster-autoscaler scales the worker node group
+    _test_scale_up_and_down(namespace, cluster_name, workload_kc_file, config_path)
+
     # Check if k8s pods are running fine in kube-system namespace
     # This also verified k8s-keystone-auth pods.
     # Waits on deployments/daemonsets, not raw pods: coredns is scaled by
@@ -269,6 +428,12 @@ def test_create_cluster(
     _dump_pods_status(workload_kc_file, namespace="openstack-system")
     _check_workload_deployments(workload_kc_file, namespace="openstack-system")
     _check_workload_daemonsets(workload_kc_file, namespace="openstack-system")
+
+    # Check metallb: the chart deploys a LoadBalancer service for the
+    # cluster API server, which depends on metallb being healthy
+    _dump_pods_status(workload_kc_file, namespace="metallb-system")
+    _check_workload_deployments(workload_kc_file, namespace="metallb-system")
+    _check_workload_daemonsets(workload_kc_file, namespace="metallb-system")
 
     # Check kubernetes dashboard
     # kubernetes-dashboard helm chart is not available

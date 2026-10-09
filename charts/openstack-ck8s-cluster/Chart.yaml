@@ -2,7 +2,7 @@ apiVersion: v2
 name: openstack-ck8s-cluster
 description: A Helm chart for for deploying a canonical kubernetes cluster on an OpenStack cloud using Cluster API.
 type: application
-version: 0.1.1
+version: 0.1.2
 # Using https://github.com/kubernetes-sigs/cluster-api version
 # Tested with v1.9.6
 appVersion: "1.9.6"
