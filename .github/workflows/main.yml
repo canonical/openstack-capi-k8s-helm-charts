@@ -10,3 +10,6 @@ jobs:
     uses: ./.github/workflows/test.yml
   release:
     uses: ./.github/workflows/release.yml
+    permissions:
+      contents: read
+      packages: write
