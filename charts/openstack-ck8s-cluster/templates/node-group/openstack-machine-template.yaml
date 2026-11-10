@@ -19,6 +19,18 @@ template:
       {{- else }}
       {{- fail "machineImageId is required" }}
       {{- end }}
+    {{- /* Boot from a Cinder volume when a size is given (Magnum's
+           boot_volume_size / boot_volume_type labels). Unset renders nothing,
+           so existing clusters keep the same template checksum. */}}
+    {{- with $nodeGroup.machineRootVolume }}
+    {{- if .diskSize }}
+    rootVolume:
+      sizeGiB: {{ .diskSize }}
+      {{- with .volumeType }}
+      type: {{ . }}
+      {{- end }}
+    {{- end }}
+    {{- end }}
 {{- end }}
 
 {{- define "openstack-ck8s-cluster.nodegroup.machinetemplate.checksum" -}}
