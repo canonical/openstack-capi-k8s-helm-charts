@@ -45,7 +45,7 @@ ck8sControlPlane:
     # ingress should deploy their own ingress controller behind a
     # LoadBalancer Service instead.
     enableDefaultIngress: false
-  # machhineTemplate: Information on how machines should be shaped (dictionary)
+  # machineTemplate: Information on how machines should be shaped (dictionary)
   machineTemplate:
     # nodeDeletionTimeout: How long the machine controller will attempt to delete the Node that the Machine hosts after the Machine is marked for deletion (string)
     nodeDeletionTimeout: 5m0s
@@ -114,6 +114,12 @@ controlPlane:
   machineCount: 1
   # machineFlavor: OpenStack flavor to use to deploy instances (string)
   machineFlavor: m1.medium
+  # machineRootVolume: Boot control plane nodes from a Cinder volume instead of
+  # the flavor's local disk (dictionary). Set by Magnum's boot_volume_size and
+  # boot_volume_type labels. No diskSize = local disk (the default).
+  # machineRootVolume:
+  #   diskSize: Root volume size in GiB (integer)
+  #   volumeType: Cinder volume type; omit for the default type (string)
 
 # kubernetesVersion: K8s version that is going to be deployed (string)
 kubernetesVersion: 1.32.6
@@ -127,6 +133,8 @@ nodeGroupDefaults:
   healthCheck:
     # enabled: Whether Health check should be enabled for worker nodes (boolean)
     enabled: true
+  # machineRootVolume: As controlPlane.machineRootVolume, for worker nodes; a
+  # node group can override it (dictionary).
 
 # nodeGroups: Configuration related to Worker node nodeGroups (list)
 nodeGroups: []
