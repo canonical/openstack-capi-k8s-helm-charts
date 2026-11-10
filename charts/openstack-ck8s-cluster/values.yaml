@@ -45,7 +45,7 @@ ck8sControlPlane:
     # ingress should deploy their own ingress controller behind a
     # LoadBalancer Service instead.
     enableDefaultIngress: false
-  # machhineTemplate: Information on how machines should be shaped (dictionary)
+  # machineTemplate: Information on how machines should be shaped (dictionary)
   machineTemplate:
     # nodeDeletionTimeout: How long the machine controller will attempt to delete the Node that the Machine hosts after the Machine is marked for deletion (string)
     nodeDeletionTimeout: 5m0s
