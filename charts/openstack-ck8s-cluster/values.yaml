@@ -45,6 +45,19 @@ ck8sControlPlane:
     # ingress should deploy their own ingress controller behind a
     # LoadBalancer Service instead.
     enableDefaultIngress: false
+    # enableDefaultLoadBalancer: Deploy the built-in load balancer (MetalLB).
+    # Disabled by default: on OpenStack, Services of type LoadBalancer belong
+    # to the OpenStack Cloud Controller Manager (OCCM), which creates the
+    # Octavia load balancer and floating IP and writes the address into the
+    # Service's status.loadBalancer.ingress. The built-in MetalLB has no
+    # address pool here (cidrs: []), so it assigns nothing but still claims
+    # every LoadBalancer Service and clears that address: Services show
+    # <pending> although Octavia serves traffic, and anything that waits for
+    # the address (helm --wait, Terraform, ingress controllers publishing
+    # their address) hangs. When unset, Canonical Kubernetes enables it
+    # whenever the default network is enabled.
+    # See https://bugs.launchpad.net/snap-openstack/+bug/2143394
+    enableDefaultLoadBalancer: false
   # machhineTemplate: Information on how machines should be shaped (dictionary)
   machineTemplate:
     # nodeDeletionTimeout: How long the machine controller will attempt to delete the Node that the Machine hosts after the Machine is marked for deletion (string)
