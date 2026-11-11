@@ -1,7 +1,9 @@
 # SPDX-FileCopyrightText: 2025 - Canonical Ltd
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 import time
+import urllib.request
 from pathlib import Path
 
 import yaml
@@ -15,6 +17,58 @@ POD_WAIT_TIMEOUT = 600  # 10 minutes for pods to settle
 SCALE_UP_TIMEOUT = 900  # 15 minutes for a new machine to be provisioned
 SCALE_DOWN_TIMEOUT = 900  # 15 minutes for an unneeded node to be removed
 AUTOSCALE_TEST_CPU_REQUEST = "1700m"  # ~one pod per 2 vCPU worker node
+LB_TEST_TIMEOUT = 900  # 15 minutes for Octavia to build the load balancer
+LB_STATUS_SAMPLES = 12  # address must stay set across 12 samples...
+LB_STATUS_INTERVAL = 5  # ...5s apart (a 1 minute window)
+LB_TEST_REQUESTS = 10
+LB_TEST_NAMESPACE = "lb-test"
+LB_TEST_SERVICE = "echo"
+# Octavia's default provider, used when the chart's cloud config sets none.
+OCTAVIA_DEFAULT_PROVIDER = "amphora"
+
+# A LoadBalancer Service in front of two replicas of a small HTTP server.
+# agnhost netexec answers GET /hostname with the serving pod's name.
+LB_TEST_MANIFEST = """
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: lb-test
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: echo
+  namespace: lb-test
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: echo
+  template:
+    metadata:
+      labels:
+        app: echo
+    spec:
+      containers:
+      - name: echo
+        image: registry.k8s.io/e2e-test-images/agnhost:2.53
+        args: ["netexec", "--http-port=8080"]
+        ports:
+        - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo
+  namespace: lb-test
+spec:
+  type: LoadBalancer
+  selector:
+    app: echo
+  ports:
+  - port: 80
+    targetPort: 8080
+"""
 
 SCALE_UP_TEST_DEPLOYMENT = """
 apiVersion: apps/v1
@@ -370,6 +424,211 @@ def _dump_pods_status(workload_kubeconfig: Path, namespace: str):
     print(f"\nPods in {namespace}:\n{output}", flush=True)
 
 
+def _workload_kubectl(workload_kubeconfig: Path, args: list, capture_output=True):
+    cmd = ["sudo", "k8s", "kubectl", "--kubeconfig", str(workload_kubeconfig), *args]
+    return utils.run_command(cmd, capture_output=capture_output)
+
+
+def _get_init_config(namespace: str, cluster_name: str) -> dict:
+    """Return the CK8sControlPlane initConfig the chart rendered.
+
+    Read from the management cluster rather than from the test's values, so
+    the check follows whatever the chart's defaults are.
+    """
+    cmd = [
+        "sudo",
+        "k8s",
+        "kubectl",
+        "get",
+        "ck8scontrolplane",
+        "--namespace",
+        namespace,
+        "--selector",
+        f"cluster.x-k8s.io/cluster-name={cluster_name}",
+        "--output",
+        "jsonpath={.items[0].spec.spec.initConfig}",
+    ]
+    output = utils.run_command(cmd, capture_output=True)
+    return json.loads(output) if output else {}
+
+
+def _load_balancer_feature_enabled(init_config: dict) -> bool:
+    """Whether Canonical Kubernetes deploys its built-in load balancer.
+
+    Mirrors cluster-api-k8s: an unset enableDefaultLoadBalancer follows
+    enableDefaultNetwork, which itself defaults to true.
+    """
+    enabled = init_config.get("enableDefaultLoadBalancer")
+    if enabled is None:
+        enabled = init_config.get("enableDefaultNetwork", True)
+    return bool(enabled)
+
+
+def _check_metallb(workload_kubeconfig: Path, init_config: dict):
+    """MetalLB is healthy when initConfig enables it, and absent when not.
+
+    Note: the API server's load balancer is created by Cluster API Provider
+    OpenStack (apiServer.enableLoadBalancer), not by a Kubernetes Service,
+    so it never depends on MetalLB.
+    """
+    if _load_balancer_feature_enabled(init_config):
+        _dump_pods_status(workload_kubeconfig, namespace="metallb-system")
+        _check_workload_deployments(workload_kubeconfig, namespace="metallb-system")
+        _check_workload_daemonsets(workload_kubeconfig, namespace="metallb-system")
+        return
+    deployments = _workload_kubectl(
+        workload_kubeconfig,
+        ["--namespace", "metallb-system", "get", "deployments,daemonsets", "--output", "name"],
+    )
+    assert not deployments, (
+        "initConfig disables the built-in load balancer, but metallb-system has: "
+        f"{deployments}"
+    )
+
+
+def _expected_octavia_provider(value_overrides: dict) -> str:
+    load_balancer = (
+        value_overrides.get("addons", {})
+        .get("openstack", {})
+        .get("cloudConfig", {})
+        .get("LoadBalancer", {})
+    )
+    return load_balancer.get("lb-provider", OCTAVIA_DEFAULT_PROVIDER)
+
+
+def _get_octavia_load_balancer(name: str) -> dict | None:
+    cmd = ["openstack", "loadbalancer", "list", "--name", name, "--format", "json"]
+    found = json.loads(utils.run_openstack_command(utils.CLOUD_ADMIN, cmd, capture_output=True))
+    assert len(found) <= 1, f"expected at most one Octavia load balancer named {name}, got {found}"
+    return found[0] if found else None
+
+
+def _get_service_address(workload_kubeconfig: Path) -> str:
+    return _workload_kubectl(
+        workload_kubeconfig,
+        [
+            "--namespace",
+            LB_TEST_NAMESPACE,
+            "get",
+            "service",
+            LB_TEST_SERVICE,
+            "--output",
+            "jsonpath={.status.loadBalancer.ingress[0].ip}",
+        ],
+    )
+
+
+def _wait_until(check, timeout: int, interval: int, message):
+    deadline = time.monotonic() + timeout
+    while True:
+        result = check()
+        if result:
+            return result
+        if time.monotonic() >= deadline:
+            raise AssertionError(message() if callable(message) else message)
+        time.sleep(interval)
+
+
+def _test_service_load_balancer(
+    cluster_name: str,
+    workload_kubeconfig: Path,
+    config_path: Path,
+    expected_provider: str,
+):
+    """A LoadBalancer Service gets a working Octavia load balancer.
+
+    The OpenStack Cloud Controller Manager (OCCM) creates an Octavia load
+    balancer and floating IP for the Service and writes the address into
+    status.loadBalancer.ingress. Checks that:
+    - the address appears, and stays set (a second load balancer
+      controller, such as an unconfigured MetalLB, clears it);
+    - Octavia reports the load balancer ACTIVE/ONLINE with the configured
+      provider (amphora or ovn);
+    - HTTP through the address reaches the pods;
+    - deleting the Service deletes the Octavia load balancer (an orphaned
+      one blocks cluster deletion).
+    """
+    manifest_file = config_path / "lb-test.yaml"
+    with open(str(manifest_file), "w") as file:
+        file.write(LB_TEST_MANIFEST)
+    _workload_kubectl(workload_kubeconfig, ["apply", "-f", str(manifest_file)], capture_output=False)
+    _check_workload_deployments(workload_kubeconfig, namespace=LB_TEST_NAMESPACE)
+
+    # OCCM names the load balancer after the cluster, namespace and Service.
+    octavia_name = f"kube_service_{cluster_name}_{LB_TEST_NAMESPACE}_{LB_TEST_SERVICE}"
+
+    # 1. The address appears
+    address = _wait_until(
+        lambda: _get_service_address(workload_kubeconfig),
+        LB_TEST_TIMEOUT,
+        10,
+        lambda: (
+            f"Service {LB_TEST_NAMESPACE}/{LB_TEST_SERVICE} has no load balancer "
+            f"address after {LB_TEST_TIMEOUT}s; Octavia load balancer: "
+            f"{_get_octavia_load_balancer(octavia_name)}"
+        ),
+    )
+    print(f"\nService {LB_TEST_NAMESPACE}/{LB_TEST_SERVICE} address: {address}", flush=True)
+
+    # 2. ...and stays set
+    for sample in range(LB_STATUS_SAMPLES):
+        time.sleep(LB_STATUS_INTERVAL)
+        current = _get_service_address(workload_kubeconfig)
+        assert current == address, (
+            f"Service load balancer address changed from {address!r} to {current!r} "
+            f"(sample {sample + 1}/{LB_STATUS_SAMPLES}): another controller is "
+            "overwriting the status OCCM sets (is MetalLB enabled?)"
+        )
+
+    # 3. Octavia agrees, with the configured provider
+    def octavia_ready():
+        lb = _get_octavia_load_balancer(octavia_name)
+        if lb and lb["provisioning_status"] == "ACTIVE" and lb["operating_status"] == "ONLINE":
+            return lb
+        return None
+
+    lb = _wait_until(
+        octavia_ready,
+        LB_TEST_TIMEOUT,
+        10,
+        lambda: f"Octavia load balancer {octavia_name} not ACTIVE/ONLINE: "
+        f"{_get_octavia_load_balancer(octavia_name)}",
+    )
+    assert lb["provider"] == expected_provider, (
+        f"Octavia load balancer {octavia_name} uses provider {lb['provider']!r}, "
+        f"expected {expected_provider!r}"
+    )
+
+    # 4. Traffic reaches the pods
+    served_by = set()
+    failures = []
+    for _ in range(LB_TEST_REQUESTS):
+        try:
+            with urllib.request.urlopen(f"http://{address}/hostname", timeout=10) as response:
+                served_by.add(response.read().decode().strip())
+        except OSError as e:
+            failures.append(str(e))
+        time.sleep(1)
+    print(f"Requests via {address} served by: {sorted(served_by)}", flush=True)
+    assert not failures, (
+        f"{len(failures)}/{LB_TEST_REQUESTS} requests to http://{address}/hostname failed: "
+        f"{failures[:3]}"
+    )
+
+    # 5. Deleting the Service deletes the Octavia load balancer
+    _workload_kubectl(
+        workload_kubeconfig,
+        ["delete", "namespace", LB_TEST_NAMESPACE, "--wait=true", f"--timeout={LB_TEST_TIMEOUT}s"],
+        capture_output=False,
+    )
+    _wait_until(
+        lambda: _get_octavia_load_balancer(octavia_name) is None,
+        LB_TEST_TIMEOUT,
+        10,
+        f"Octavia load balancer {octavia_name} still exists after its Service was deleted",
+    )
+
+
 def test_create_cluster(
     setup,
     value_overrides,
@@ -429,11 +688,20 @@ def test_create_cluster(
     _check_workload_deployments(workload_kc_file, namespace="openstack-system")
     _check_workload_daemonsets(workload_kc_file, namespace="openstack-system")
 
-    # Check metallb: the chart deploys a LoadBalancer service for the
-    # cluster API server, which depends on metallb being healthy
-    _dump_pods_status(workload_kc_file, namespace="metallb-system")
-    _check_workload_deployments(workload_kc_file, namespace="metallb-system")
-    _check_workload_daemonsets(workload_kc_file, namespace="metallb-system")
+    # Check the built-in load balancer (MetalLB): healthy if initConfig
+    # enables it, absent if not. The chart disables it by default: on
+    # OpenStack, OCCM owns LoadBalancer Services.
+    init_config = _get_init_config(namespace, cluster_name)
+    print(f"\nCK8sControlPlane initConfig: {init_config}", flush=True)
+    _check_metallb(workload_kc_file, init_config)
+
+    # Check LoadBalancer Services end to end through OCCM and Octavia
+    _test_service_load_balancer(
+        cluster_name,
+        workload_kc_file,
+        config_path,
+        _expected_octavia_provider(value_overrides),
+    )
 
     # Check kubernetes dashboard
     # kubernetes-dashboard helm chart is not available
